@@ -1709,6 +1709,7 @@ class EngineService:
             f" --rr_attention_threshold {self.cfg.model_config.rr_attention_threshold}"
             f" --rr_attention_stride {self.cfg.model_config.rr_attention_stride}"
             f" --eplb_config '{self.cfg.eplb_config.to_json_string()}'"
+            f" --num_cpu_blocks {self.cfg.cache_config.num_cpu_blocks}"
         )
         if self.cfg.structured_outputs_config.logits_processors is not None:
             arguments += f" --logits-processors {' '.join(self.cfg.structured_outputs_config.logits_processors)}"
