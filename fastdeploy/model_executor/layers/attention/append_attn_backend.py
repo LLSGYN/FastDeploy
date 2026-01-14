@@ -164,6 +164,20 @@ class AppendAttentionBackend(AttentionBackend):
 
         self.rank, self.device_id = init_rank_and_device_id(fd_config)
         self.use_output = not fd_config.graph_opt_config.full_cuda_graph
+        if self.use_output:
+            flag = "FLAGS_cuda_graph_blacklist"
+            paddle.set_flags(
+                {
+                    flag: ",".join(
+                        list(
+                            set(
+                                paddle.get_flags(flag)[flag].split(",")
+                                + ["custom_op.static_op_append_attention_with_output_"]
+                            )
+                        )
+                    )
+                }
+            )
         self.fd_config = fd_config
         self.enable_rr_attention: bool = bool(getattr(fd_config.model_config, "enable_rr_attention", False))
         self.rr_attention_threshold: float = float(getattr(fd_config.model_config, "rr_attention_threshold", 1.0))
