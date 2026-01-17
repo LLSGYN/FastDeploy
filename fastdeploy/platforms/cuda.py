@@ -58,6 +58,12 @@ class CUDAPlatform(Platform):
         elif selected_backend == _Backend.APPEND_ATTN:
             logger.info("Using APPEND ATTN backend.")
             return "fastdeploy.model_executor.layers.attention.AppendAttentionBackend"
+        elif selected_backend == _Backend.APPEND_ATTN_FLASHMASK_PREFILL:
+            logger.info("Using APPEND ATTN (FLASHMASK PREFILL) backend.")
+            return (
+                "fastdeploy.model_executor.layers.attention.append_attn_flashmask_prefill_backend."
+                "AppendAttentionFlashMaskPrefillBackend"
+            )
         elif selected_backend == _Backend.MLA_ATTN:
             logger.info("Using MLA ATTN backend.")
             return "fastdeploy.model_executor.layers.attention.MLAAttentionBackend"
@@ -73,5 +79,5 @@ class CUDAPlatform(Platform):
         else:
             raise ValueError(
                 "Invalid attention backend you specified.\n"
-                "Now only support [NATIVE_ATTN, MLA_ATTN, APPEND_ATTN] in cuda place."
+                "Now only support [NATIVE_ATTN, MLA_ATTN, APPEND_ATTN, APPEND_ATTN_FLASHMASK_PREFILL] in cuda place."
             )

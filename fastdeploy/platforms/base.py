@@ -23,6 +23,7 @@ import paddle
 class _Backend(enum.Enum):
     NATIVE_ATTN = enum.auto()
     APPEND_ATTN = enum.auto()
+    APPEND_ATTN_FLASHMASK_PREFILL = enum.auto()
     MLA_ATTN = enum.auto()
     FLASH_ATTN = enum.auto()
     BLOCK_ATTN = enum.auto()
