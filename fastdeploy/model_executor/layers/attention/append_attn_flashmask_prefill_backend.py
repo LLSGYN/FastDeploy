@@ -19,8 +19,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-import numpy as np
 import paddle
+import paddle.nn.functional as F
 
 from fastdeploy.model_executor.layers.attention.append_attn_backend import AppendAttentionBackend
 from fastdeploy.model_executor.layers.attention.attention import Attention
@@ -118,13 +118,22 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
             max_dec_len_this_time = int(max_len_tensor_cpu[2].item())
             max_just_dec_len_this_time = int(max_len_tensor_cpu[4].item())
 
-            seq_lens_this_time_list = (
-                forward_meta.seq_lens_this_time.reshape([-1]).cpu().numpy().astype("int32").tolist()
-            )
-            effective_batch_size = sum(1 for x in seq_lens_this_time_list if int(x) > 0)
+            # Avoid any GPU->CPU sync/copy here: during CUDA Graph capture, `.cpu()`/`.numpy()`/`.item()`
+            # on GPU tensors will trigger `cudaErrorStreamCaptureImplicit`.
+            # For strict mode, require the scheduler/engine to be configured with batch size 1.
+            seq_lens_this_time = forward_meta.seq_lens_this_time
+            if len(seq_lens_this_time.shape) not in (1, 2):
+                raise AssertionError(
+                    "FD_STRICT_PURE_PREFILL_DECODE=1 expects seq_lens_this_time to be rank-1/2 tensor, "
+                    f"got shape={list(seq_lens_this_time.shape)}."
+                )
+            effective_batch_size = int(seq_lens_this_time.shape[0])
             if effective_batch_size != 1:
                 raise AssertionError(
-                    f"FD_STRICT_PURE_PREFILL_DECODE=1 requires effective batch size=1, got {effective_batch_size}."
+                    "FD_STRICT_PURE_PREFILL_DECODE=1 requires effective batch size=1. "
+                    f"Got seq_lens_this_time.shape[0]={effective_batch_size}. "
+                    "Please configure the engine with max_num_seqs=1 (e.g. LLM(..., max_num_seqs=1) "
+                    "or CLI --max_num_seqs 1)."
                 )
 
             is_pure_prefill = max_enc_len_this_time > 0 and max_dec_len_this_time == 0 and max_just_dec_len_this_time == 0
@@ -138,6 +147,11 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
                 )
 
         if use_paddle_flashmask_prefill and current_platform.is_cuda():
+            # This experimental path must be CUDA Graph capture-safe (no GPU->CPU sync/copy).
+            # For now, only support the strict single-sequence case.
+            if not strict_pure_prefill_decode:
+                return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
+
             cache_quant_type_str = getattr(layer, "cache_quant_type_str", "none")
             if cache_quant_type_str == "none":
                 cache_k = forward_meta.caches[2 * layer.layer_id]
@@ -228,52 +242,32 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
                 if int(k_packed.shape[0]) != token_num or int(v_packed.shape[0]) != token_num:
                     raise NotImplementedError("flashmask prefill path only supports first prefill (no KV history).")
 
-                seq_lens_this_time_list = (
-                    forward_meta.seq_lens_this_time.reshape([-1]).cpu().numpy().astype("int32").tolist()
-                )
-                seq_lens_encoder_list = (
-                    forward_meta.seq_lens_encoder.reshape([-1]).cpu().numpy().astype("int32").tolist()
-                )
-                active_bids = [
-                    bid
-                    for bid, (l_this, l_enc) in enumerate(zip(seq_lens_this_time_list, seq_lens_encoder_list))
-                    if int(l_this) > 0 and int(l_enc) > 0
-                ]
-                bsz_active = len(active_bids)
-                if bsz_active == 0:
+                if token_num == 0:
                     return paddle.empty([0, self.num_heads * self.head_dim], dtype=qkv.dtype)
 
-                q_dense = paddle.zeros([bsz_active, max_len_this_time, self.num_heads, self.head_dim], dtype=qkv.dtype)
-                k_dense = paddle.zeros([bsz_active, max_len_this_time, self.kv_num_heads, self.head_dim], dtype=qkv.dtype)
-                v_dense = paddle.zeros([bsz_active, max_len_this_time, self.kv_num_heads, self.head_dim], dtype=qkv.dtype)
+                if token_num > max_len_this_time:
+                    raise RuntimeError(
+                        "flashmask prefill expects token_num <= max_len_this_time, "
+                        f"got token_num={token_num}, max_len_this_time={max_len_this_time}."
+                    )
 
-                startend = np.full((bsz_active, 1, max_len_this_time, 1), max_len_this_time, dtype=np.int32)
+                q_dense = paddle.zeros([1, max_len_this_time, self.num_heads, self.head_dim], dtype=qkv.dtype)
+                k_dense = paddle.zeros([1, max_len_this_time, self.kv_num_heads, self.head_dim], dtype=qkv.dtype)
+                v_dense = paddle.zeros([1, max_len_this_time, self.kv_num_heads, self.head_dim], dtype=qkv.dtype)
 
-                offset = 0
-                row = 0
-                for bid in range(len(seq_lens_this_time_list)):
-                    l_this = int(seq_lens_this_time_list[bid])
-                    if l_this <= 0:
-                        continue
-                    if int(seq_lens_encoder_list[bid]) <= 0:
-                        raise NotImplementedError("flashmask prefill path does not support mixed prefill/decode batches.")
-                    q_dense[row, :l_this] = q_packed[offset : offset + l_this]
-                    k_dense[row, :l_this] = k_packed[offset : offset + l_this]
-                    v_dense[row, :l_this] = v_packed[offset : offset + l_this]
-                    startend[row, 0, l_this:, 0] = 0
-                    offset += l_this
-                    row += 1
-
-                if offset != token_num:
-                    raise RuntimeError("flashmask prefill pack/unpack mismatch.")
+                q_dense[0, :token_num] = q_packed
+                k_dense[0, :token_num] = k_packed
+                v_dense[0, :token_num] = v_packed
 
                 if self.kv_num_heads != self.num_heads:
                     k_dense = paddle.repeat_interleave(k_dense, self.group_size, axis=2)
                     v_dense = paddle.repeat_interleave(v_dense, self.group_size, axis=2)
 
-                import paddle.nn.functional as F
 
-                startend_tensor = paddle.to_tensor(startend, place=q_dense.place)
+                startend_tensor = paddle.full([1, 1, max_len_this_time, 1], max_len_this_time, dtype="int32")
+                if token_num < max_len_this_time:
+                    startend_tensor[:, :, token_num:, :] = 0
+                startend_tensor = startend_tensor.to(q_dense.place)
                 out_dense = F.flashmask_attention(
                     q_dense,
                     k_dense,
@@ -284,19 +278,6 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
                     training=True,
                 )
 
-                out_packed = paddle.empty([token_num, self.num_heads * self.head_dim], dtype=out_dense.dtype)
-                offset = 0
-                row = 0
-                for bid in range(len(seq_lens_this_time_list)):
-                    l_this = int(seq_lens_this_time_list[bid])
-                    if l_this <= 0:
-                        continue
-                    out_packed[offset : offset + l_this] = out_dense[row, :l_this].reshape(
-                        [l_this, self.num_heads * self.head_dim]
-                    )
-                    offset += l_this
-                    row += 1
-                return out_packed
+                return out_dense[0, :token_num].reshape([token_num, self.num_heads * self.head_dim])
 
         return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
-
