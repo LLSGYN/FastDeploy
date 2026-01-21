@@ -31,6 +31,7 @@ from fastdeploy.model_executor.layers.attention.ops import (
     pre_cache_len_concat,
 )
 from fastdeploy.platforms import current_platform
+from fastdeploy.utils import console_logger as logger
 
 if TYPE_CHECKING:
     from fastdeploy.model_executor.forward_meta import ForwardMeta
@@ -49,6 +50,10 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
     - FD_STRICT_PURE_PREFILL_DECODE=1: assert effective batch size==1 and pure prefill/decode only
     """
 
+    _debug = os.getenv("FD_DEBUG_ATTN_BACKEND", "0").lower() in ("1", "true")
+    _break_on_entry = os.getenv("FD_BREAK_ON_ATTN_BACKEND", "0").lower() in ("1", "true")
+    _break_fired = False
+
     def forward_mixed(
         self,
         q: paddle.Tensor,
@@ -62,6 +67,19 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
     ) -> paddle.Tensor:
         strict_pure_prefill_decode = os.getenv("FD_STRICT_PURE_PREFILL_DECODE", "0").lower() in ("1", "true")
         use_paddle_flashmask_prefill = os.getenv("FD_USE_PADDLE_FLASHMASK_PREFILL", "0").lower() in ("1", "true")
+
+        if self._break_on_entry and (not self._break_fired) and layer.layer_id == 0:
+            type(self)._break_fired = True
+            raise RuntimeError("FD_BREAK_ON_ATTN_BACKEND: hit AppendAttentionFlashMaskPrefillBackend.forward_mixed")
+
+        if self._debug and layer.layer_id == 0:
+            logger.info(
+                "[AppendAttentionFlashMaskPrefillBackend] enter forward_mixed "
+                f"(pid={os.getpid()}, strict={strict_pure_prefill_decode}, "
+                f"use_flashmask={use_paddle_flashmask_prefill}, "
+                f"step_use_cudagraph={getattr(forward_meta, 'step_use_cudagraph', None)}, "
+                f"qkv_dtype={getattr(qkv, 'dtype', None)})"
+            )
         if not (strict_pure_prefill_decode or use_paddle_flashmask_prefill):
             return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
 
@@ -150,6 +168,11 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
             # This experimental path must be CUDA Graph capture-safe (no GPU->CPU sync/copy).
             # For now, only support the strict single-sequence case.
             if not strict_pure_prefill_decode:
+                if self._debug and layer.layer_id == 0:
+                    logger.info(
+                        "[AppendAttentionFlashMaskPrefillBackend] flashmask prefill requested but strict mode is off; "
+                        "falling back to AppendAttentionBackend."
+                    )
                 return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
 
             cache_quant_type_str = getattr(layer, "cache_quant_type_str", "none")
@@ -175,7 +198,7 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
             max_dec_len_this_time = int(max_len_tensor_cpu[2].item())
             max_just_dec_len_this_time = int(max_len_tensor_cpu[4].item())
 
-            if (
+            eligible_flashmask_prefill = (
                 fa_version == 3
                 and not (cudnn_deterministic and self.head_dim > 128)
                 and max_enc_len_this_time > 0
@@ -187,7 +210,27 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
                 and forward_meta.attn_mask is None
                 and forward_meta.attn_mask_offsets is None
                 and sliding_window == 0
-            ):
+            )
+
+            if self._debug and layer.layer_id == 0:
+                logger.info(
+                    "[AppendAttentionFlashMaskPrefillBackend] flashmask prefill eligibility: "
+                    f"{eligible_flashmask_prefill} "
+                    f"(fa_version={fa_version}, cudnn_deterministic={cudnn_deterministic}, "
+                    f"max_enc_len_this_time={max_enc_len_this_time}, "
+                    f"max_dec_len_this_time={max_dec_len_this_time}, "
+                    f"max_just_dec_len_this_time={max_just_dec_len_this_time}, "
+                    f"qkv_dtype={qkv.dtype}, "
+                    f"attn_mask_is_none={forward_meta.attn_mask is None}, "
+                    f"attn_mask_offsets_is_none={forward_meta.attn_mask_offsets is None}, "
+                    f"sliding_window={sliding_window})"
+                )
+
+            if eligible_flashmask_prefill:
+                if self._debug and layer.layer_id == 0:
+                    logger.info(
+                        "[AppendAttentionFlashMaskPrefillBackend] using Paddle flashmask_attention for first prefill."
+                    )
                 (
                     attn_cu_seqlens_k,
                     pre_cache_batch_ids,
@@ -280,4 +323,9 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
 
                 return out_dense[0, :token_num].reshape([token_num, self.num_heads * self.head_dim])
 
+        if self._debug and layer.layer_id == 0 and use_paddle_flashmask_prefill and current_platform.is_cuda():
+            logger.info(
+                "[AppendAttentionFlashMaskPrefillBackend] flashmask prefill path not taken; "
+                "falling back to AppendAttentionBackend."
+            )
         return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)

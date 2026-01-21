@@ -6,12 +6,17 @@
 import os
 import sys
 import time
+import inspect
 from fastdeploy import LLM, SamplingParams
 
 def print_environment_info():
     """打印环境信息和配置"""
     print("=" * 60)
     print("环境配置信息:")
+    import fastdeploy
+    print(f"fastdeploy路径: {fastdeploy.__file__}")
+    print(f"Python可执行文件: {sys.executable}")
+    print(f"sys.flags.optimize: {sys.flags.optimize} (PYTHONOPTIMIZE={os.getenv('PYTHONOPTIMIZE', '未设置')})")
     print(f"FD_ATTENTION_BACKEND: {os.getenv('FD_ATTENTION_BACKEND', '未设置')}")
     print(f"FD_USE_PADDLE_FLASHMASK_PREFILL: {os.getenv('FD_USE_PADDLE_FLASHMASK_PREFILL', '未设置')}")
     print(f"FD_STRICT_PURE_PREFILL_DECODE: {os.getenv('FD_STRICT_PURE_PREFILL_DECODE', '未设置')}")
@@ -38,13 +43,18 @@ def test_basic_inference():
         
         # 加载模型 - 使用最小的配置
         start_time = time.time()
+        graph_optimization_config = None
+        if os.getenv("FD_TEST_DISABLE_CUDAGRAPH", "0").lower() in ("1", "true"):
+            graph_optimization_config = {"use_cudagraph": False, "graph_opt_level": 0}
+            print(f"⚠️ 已禁用CUDAGraph用于调试: {graph_optimization_config}")
         llm = LLM(
             model=model_name,
             tensor_parallel_size=1,  # 单卡
             max_model_len=2048,      # 减小模型长度以减少内存需求
             gpu_memory_utilization=0.7,  # 进一步增加内存利用率
             max_num_seqs=1,         # 限制并发数为1
-            max_num_batched_tokens=2048  # 设置与max_model_len相同的值
+            max_num_batched_tokens=2048,  # 设置与max_model_len相同的值
+            graph_optimization_config=graph_optimization_config,
         )
         load_time = time.time() - start_time
         print(f"模型加载完成，耗时: {load_time:.2f}秒")
@@ -91,6 +101,7 @@ def test_experimental_features():
         from fastdeploy.model_executor.layers.attention.append_attn_flashmask_prefill_backend import AppendAttentionFlashMaskPrefillBackend
         
         print("实验性 backend 类已成功导入")
+        print(f"backend源码路径: {inspect.getfile(AppendAttentionFlashMaskPrefillBackend)}")
         
         # 检查环境变量设置
         use_flashmask_prefill = os.getenv("FD_USE_PADDLE_FLASHMASK_PREFILL", "0")
