@@ -1700,6 +1700,8 @@ class EngineService:
             f" --override-pooler-config {self.cfg.model_config.override_pooler_config}"
             f" --logprobs_mode {self.cfg.model_config.logprobs_mode}"
             f" --max_logprobs {self.cfg.model_config.max_logprobs}"
+            f" --rr_attention_threshold {self.cfg.model_config.rr_attention_threshold}"
+            f" --rr_attention_stride {self.cfg.model_config.rr_attention_stride}"
             f" --eplb_config '{self.cfg.eplb_config.to_json_string()}'"
         )
         if self.cfg.structured_outputs_config.logits_processors is not None:
@@ -1718,6 +1720,7 @@ class EngineService:
             "enable_logprob": self.cfg.model_config.enable_logprob,
             "lm_head_fp32": self.cfg.model_config.lm_head_fp32,
             "enable_entropy": self.cfg.model_config.enable_entropy,
+            "enable_rr_attention": self.cfg.model_config.enable_rr_attention,
         }
         for worker_flag, value in worker_store_true_flag.items():
             if value:

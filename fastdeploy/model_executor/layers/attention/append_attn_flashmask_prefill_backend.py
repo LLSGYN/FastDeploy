@@ -21,6 +21,10 @@ from typing import TYPE_CHECKING
 
 import paddle
 import paddle.nn.functional as F
+try:
+    import paddlefleet  # type: ignore
+except ModuleNotFoundError:
+    paddlefleet = None
 
 from fastdeploy.model_executor.layers.attention.append_attn_backend import AppendAttentionBackend
 from fastdeploy.model_executor.layers.attention.attention import Attention
@@ -302,24 +306,44 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
                 k_dense[0, :token_num] = k_packed
                 v_dense[0, :token_num] = v_packed
 
-                if self.kv_num_heads != self.num_heads:
-                    k_dense = paddle.repeat_interleave(k_dense, self.group_size, axis=2)
-                    v_dense = paddle.repeat_interleave(v_dense, self.group_size, axis=2)
+                # # Flashmask attention support GQA natively; no need to repeat_interleave.
+                # if self.kv_num_heads != self.num_heads:
+                #     k_dense = paddle.repeat_interleave(k_dense, self.group_size, axis=2)
+                #     v_dense = paddle.repeat_interleave(v_dense, self.group_size, axis=2)
 
 
                 startend_tensor = paddle.full([1, 1, max_len_this_time, 1], max_len_this_time, dtype="int32")
                 if token_num < max_len_this_time:
                     startend_tensor[:, :, token_num:, :] = 0
                 startend_tensor = startend_tensor.to(q_dense.place)
-                out_dense = F.flashmask_attention(
-                    q_dense,
-                    k_dense,
-                    v_dense,
-                    startend_tensor,
-                    dropout=0.0,
-                    causal=self.causal,
-                    training=True,
-                )
+                
+                if self.enable_rr_attention:
+                    if paddlefleet is None or not hasattr(getattr(paddlefleet, "ops", None), "rr_attention"):
+                        raise RuntimeError(
+                            "enable_rr_attention=True requires `paddlefleet` with `paddlefleet.ops.rr_attention` "
+                            "available. Please install/enable paddlefleet or disable rr attention."
+                        )
+                    out_dense = paddlefleet.ops.rr_attention(
+                        q_dense,
+                        k_dense,
+                        v_dense,
+                        startend_tensor,
+                        dropout=0.0,
+                        causal=self.causal,
+                        training=True,
+                        threshold=self.rr_attention_threshold,
+                        stride=self.rr_attention_stride,
+                    )
+                else:
+                    out_dense = F.flashmask_attention(
+                        q_dense,
+                        k_dense,
+                        v_dense,
+                        startend_tensor,
+                        dropout=0.0,
+                        causal=self.causal,
+                        training=True,
+                    )
 
                 return out_dense[0, :token_num].reshape([token_num, self.num_heads * self.head_dim])
 

@@ -765,6 +765,23 @@ def parse_args():
         help="Configation of plas attention.",
     )
     parser.add_argument(
+        "--enable_rr_attention",
+        action="store_true",
+        help="Enable paddlefleet rr_attention (used in flashmask prefill path).",
+    )
+    parser.add_argument(
+        "--rr_attention_threshold",
+        type=float,
+        default=1.0,
+        help="Threshold for paddlefleet rr_attention.",
+    )
+    parser.add_argument(
+        "--rr_attention_stride",
+        type=int,
+        default=8,
+        help="Stride for paddlefleet rr_attention.",
+    )
+    parser.add_argument(
         "--guided_decoding_backend",
         type=str,
         default="off",

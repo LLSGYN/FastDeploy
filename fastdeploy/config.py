@@ -218,6 +218,9 @@ class ModelConfig:
         self.prefix_layer_name = "layers"
         self.kv_cache_quant_scale_path = ""
         self.enable_entropy = False
+        self.enable_rr_attention: bool = False
+        self.rr_attention_threshold: float = 1.0
+        self.rr_attention_stride: int = 8
 
         self.partial_rotary_factor: float = 1.0
         self.num_nextn_predict_layers = 0
@@ -1893,6 +1896,17 @@ class FDConfig:
         assert (
             self.model_config.max_model_len >= 16
         ), f"max_model_len: {self.model_config.max_model_len} should be larger than 16"
+        if getattr(self.model_config, "enable_rr_attention", False):
+            rr_attention_threshold = float(getattr(self.model_config, "rr_attention_threshold", 1.0))
+            rr_attention_stride = int(getattr(self.model_config, "rr_attention_stride", 8))
+            assert rr_attention_threshold > 0.0, (
+                "rr_attention_threshold must be > 0 when enable_rr_attention is True, "
+                f"but got {rr_attention_threshold}."
+            )
+            assert rr_attention_stride > 0, (
+                "rr_attention_stride must be > 0 when enable_rr_attention is True, "
+                f"but got {rr_attention_stride}."
+            )
         assert (
             self.scheduler_config.max_num_seqs >= 1
         ), f"max_num_seqs: {self.scheduler_config.max_num_seqs} should be larger than 1"

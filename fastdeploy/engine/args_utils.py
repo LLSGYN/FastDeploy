@@ -434,6 +434,21 @@ class EngineArgs:
     Configuration for plas attention.
     """
 
+    enable_rr_attention: bool = False
+    """
+    Enable paddlefleet `rr_attention` (used in flashmask prefill path when available).
+    """
+
+    rr_attention_threshold: float = 1.0
+    """
+    Threshold for paddlefleet `rr_attention`.
+    """
+
+    rr_attention_stride: int = 8
+    """
+    Stride for paddlefleet `rr_attention`.
+    """
+
     enable_logprob: bool = False
     """
     Flag to enable logprob output. Default is False (disabled).
@@ -820,6 +835,24 @@ class EngineArgs:
             type=json.loads,
             default=EngineArgs.plas_attention_config,
             help="",
+        )
+        model_group.add_argument(
+            "--enable-rr-attention",
+            action="store_true",
+            default=EngineArgs.enable_rr_attention,
+            help="Enable paddlefleet rr_attention (used in flashmask prefill path).",
+        )
+        model_group.add_argument(
+            "--rr-attention-threshold",
+            type=float,
+            default=EngineArgs.rr_attention_threshold,
+            help="Threshold for paddlefleet rr_attention.",
+        )
+        model_group.add_argument(
+            "--rr-attention-stride",
+            type=int,
+            default=EngineArgs.rr_attention_stride,
+            help="Stride for paddlefleet rr_attention.",
         )
         model_group.add_argument(
             "--guided-decoding-backend",
