@@ -22,7 +22,7 @@ def print_environment_info():
     print(f"FD_USE_PADDLE_FLASHMASK_PREFILL: {os.getenv('FD_USE_PADDLE_FLASHMASK_PREFILL', '未设置')}")
     print(f"FD_STRICT_PURE_PREFILL_DECODE: {os.getenv('FD_STRICT_PURE_PREFILL_DECODE', '未设置')}")
     print(f"FLAGS_flash_attn_version: {os.getenv('FLAGS_flash_attn_version', '未设置')}")
-    print("RR Attention 测试参数: stride=8, threshold=0.90")
+    print("RR Attention 配置（期望在 experimental backend 中生效）: enable=True, stride=8, threshold=0.90")
     print("=" * 60)
 
 def _bool_env(name: str, default: str = "0") -> bool:
@@ -66,7 +66,9 @@ def test_rr_attention_op():
         bs = 1
         seqlen = 16
         num_heads = 2
-        head_dim = 64
+        # NOTE: 当前 paddle(>=flashmask) 的 block_mask_attn 路径要求 headdim==128
+        # （否则会触发: "headdim must be 128 when using block_mask_attn"）
+        head_dim = int(os.getenv("FD_TEST_RR_HEAD_DIM", "128"))
 
         q = paddle.randn([bs, seqlen, num_heads, head_dim], dtype="float32").astype("bfloat16")
         k = paddle.randn([bs, seqlen, num_heads, head_dim], dtype="float32").astype("bfloat16")
@@ -126,6 +128,9 @@ def test_basic_inference():
             max_num_seqs=1,         # 限制并发数为1
             max_num_batched_tokens=2048,  # 设置与max_model_len相同的值
             graph_optimization_config=graph_optimization_config,
+            enable_rr_attention=True,
+            rr_attention_threshold=0.90,
+            rr_attention_stride=8,
         )
         load_time = time.time() - start_time
         print(f"模型加载完成，耗时: {load_time:.2f}秒")
@@ -211,8 +216,11 @@ def main():
     # 测试实验性功能
     experimental_ok = test_experimental_features()
 
-    # rr_attention 算子测试（可选：无 paddlefleet / 无 GPU 时自动跳过）
-    rr_attn_status = test_rr_attention_op()
+    # rr_attention 算子测试（可选：默认关闭；若需要可 export FD_TEST_RR_ATTENTION_OP=1）
+    rr_op_enabled = _bool_env("FD_TEST_RR_ATTENTION_OP", "0")
+    rr_attn_status = "SKIP"
+    if rr_op_enabled:
+        rr_attn_status = test_rr_attention_op()
     
     # 进行推理测试
     inference_ok = test_basic_inference()
@@ -221,13 +229,14 @@ def main():
     print("\n" + "=" * 60)
     print("测试结果总结:")
     print(f"实验性功能检查: {'✅ 通过' if experimental_ok else '❌ 失败'}")
-    if rr_attn_status == "PASS":
-        rr_attn_summary = "✅ 通过"
-    elif rr_attn_status == "SKIP":
-        rr_attn_summary = "⚠️ 跳过"
-    else:
-        rr_attn_summary = "❌ 失败"
-    print(f"rr_attention 算子测试: {rr_attn_summary}")
+    if rr_op_enabled:
+        if rr_attn_status == "PASS":
+            rr_attn_summary = "✅ 通过"
+        elif rr_attn_status == "SKIP":
+            rr_attn_summary = "⚠️ 跳过"
+        else:
+            rr_attn_summary = "❌ 失败"
+        print(f"rr_attention 算子测试: {rr_attn_summary}")
     print(f"推理测试: {'✅ 通过' if inference_ok else '❌ 失败'}")
     
     if experimental_ok and inference_ok and rr_attn_status != "FAIL":

@@ -71,6 +71,9 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
     ) -> paddle.Tensor:
         strict_pure_prefill_decode = os.getenv("FD_STRICT_PURE_PREFILL_DECODE", "0").lower() in ("1", "true")
         use_paddle_flashmask_prefill = os.getenv("FD_USE_PADDLE_FLASHMASK_PREFILL", "0").lower() in ("1", "true")
+        # rr_attention uses the same flashmask prefill path; enabling it implicitly requests that path.
+        if self.enable_rr_attention:
+            use_paddle_flashmask_prefill = True
 
         if self._break_on_entry and (not self._break_fired) and layer.layer_id == 0:
             type(self)._break_fired = True
@@ -232,9 +235,15 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
 
             if eligible_flashmask_prefill:
                 if self._debug and layer.layer_id == 0:
-                    logger.info(
-                        "[AppendAttentionFlashMaskPrefillBackend] using Paddle flashmask_attention for first prefill."
-                    )
+                    if self.enable_rr_attention:
+                        logger.info(
+                            "[AppendAttentionFlashMaskPrefillBackend] using paddlefleet rr_attention for first prefill "
+                            f"(threshold={self.rr_attention_threshold}, stride={self.rr_attention_stride})."
+                        )
+                    else:
+                        logger.info(
+                            "[AppendAttentionFlashMaskPrefillBackend] using Paddle flashmask_attention for first prefill."
+                        )
                 (
                     attn_cu_seqlens_k,
                     pre_cache_batch_ids,
@@ -322,6 +331,11 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
                         raise RuntimeError(
                             "enable_rr_attention=True requires `paddlefleet` with `paddlefleet.ops.rr_attention` "
                             "available. Please install/enable paddlefleet or disable rr attention."
+                        )
+                    if self.head_dim != 128:
+                        raise RuntimeError(
+                            "enable_rr_attention=True requires head_dim==128 for the current rr_attention "
+                            f"implementation, but got head_dim={self.head_dim}."
                         )
                     out_dense = paddlefleet.ops.rr_attention(
                         q_dense,
