@@ -229,6 +229,9 @@ class ModelConfig:
         self.model_impl: ModelImpl = "auto"
 
         self.partial_rotary_factor: float = 1.0
+        # Qwen-family YaRN RoPE options (kept opt-in to preserve default behavior).
+        self.qwen_rope_enable_yarn: bool = False
+        self.qwen_rope_scaling_factor: Optional[float] = None
         self.num_nextn_predict_layers = 0
         for key, value in args.items():
             if hasattr(self, key) and value != "None":

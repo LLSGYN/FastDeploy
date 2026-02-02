@@ -110,6 +110,15 @@ class EngineArgs:
     """
     Maximum context length supported by the model.
     """
+    qwen_rope_enable_yarn: bool = False
+    """
+    Enable YaRN rotary embedding for Qwen-family models (e.g., Qwen2).
+    """
+    qwen_rope_scaling_factor: Optional[float] = None
+    """
+    YaRN rope scaling factor (target_len / original_len) for Qwen-family models.
+    Only used when qwen_rope_enable_yarn is enabled.
+    """
     tensor_parallel_size: int = 1
     """
     Degree of tensor parallelism.
@@ -721,6 +730,21 @@ class EngineArgs:
             type=int,
             default=EngineArgs.max_model_len,
             help="Maximum context length supported by the model.",
+        )
+        model_group.add_argument(
+            "--qwen-rope-enable-yarn",
+            action="store_true",
+            default=EngineArgs.qwen_rope_enable_yarn,
+            help="Enable YaRN rotary embedding for Qwen-family models.",
+        )
+        model_group.add_argument(
+            "--qwen-rope-scaling-factor",
+            type=float,
+            default=EngineArgs.qwen_rope_scaling_factor,
+            help=(
+                "YaRN rope scaling factor (target_len / original_len) for Qwen-family models. "
+                "Only used when --qwen-rope-enable-yarn is set."
+            ),
         )
         model_group.add_argument(
             "--block-size",

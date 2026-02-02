@@ -322,6 +322,77 @@ class GptOssScalingRotaryEmbedding:
         return pos_emb
 
 
+class QwenYarnScalingRotaryEmbedding:
+    """
+    Qwen rotary embedding with YaRN scaling.
+
+    Notes:
+    - For CUDA/CPU paths, return the Neox-style RoPE table: [2, B, S, 1, D].
+    - For GCU, return the fused table format: [B, S, D] where D = (cos, sin) concatenation.
+    """
+
+    def __init__(
+        self,
+        rotary_dim: int,
+        base: int = 10000,
+        *,
+        scale: float = 1.0,
+        original_max_position_embeddings: int = 2048,
+        extrapolation_factor: float = 1.0,
+        attn_factor: float = 1.0,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
+        mscale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.rotary_dim = rotary_dim
+        self.base = base
+        self.scale = float(scale)
+        self.original_max_position_embeddings = int(original_max_position_embeddings)
+        self.extrapolation_factor = float(extrapolation_factor)
+        self.attn_factor = float(attn_factor)
+        self.beta_fast = int(beta_fast)
+        self.beta_slow = int(beta_slow)
+        self.mscale = float(mscale)
+
+    def __call__(self, position_ids: paddle.Tensor) -> paddle.Tensor:
+        if self.scale <= 0:
+            raise ValueError(f"YaRN rope scaling factor must be > 0, but got {self.scale}.")
+
+        bsz, seq_length = position_ids.shape[:2]
+        pos_freqs = self.base ** (paddle.arange(0, self.rotary_dim, 2, dtype="float32") / self.rotary_dim)
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (self.scale * pos_freqs)
+
+        low, high = yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            self.rotary_dim,
+            self.base,
+            self.original_max_position_embeddings,
+        )
+        inv_freq_mask = (1 - yarn_linear_ramp_mask(low, high, self.rotary_dim // 2)) * self.extrapolation_factor
+        inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+
+        _mscale = paddle.to_tensor(yarn_get_mscale(self.scale, self.mscale) * self.attn_factor, dtype="float32")
+
+        sinusoid_inp = position_ids.unsqueeze(-1).astype("float32") * inv_freq.unsqueeze(0)
+
+        if current_platform.is_gcu():
+            cos = paddle.cos(sinusoid_inp) * _mscale
+            sin = paddle.sin(sinusoid_inp) * _mscale
+            pos_emb = paddle.concat([cos, sin], axis=-1)
+            pos_emb.stop_gradient = True
+            return pos_emb
+
+        emb = paddle.concat([sinusoid_inp, sinusoid_inp], axis=-1).reshape((bsz, seq_length, 1, self.rotary_dim))
+        rot_emb = paddle.zeros((2, bsz, seq_length, 1, self.rotary_dim), dtype="float32")
+        rot_emb[0] = paddle.cos(emb) * _mscale
+        rot_emb[1] = paddle.sin(emb) * _mscale
+        rot_emb.stop_gradient = True
+        return rot_emb
+
+
 def get_rope_impl(
     rotary_dim: int,
     base: 10000.0,
@@ -335,8 +406,47 @@ def get_rope_impl(
 
     architecture = model_config.architectures[0]
     if architecture.startswith("Qwen"):
-        rotary_emb_layer = QwenRotaryEmbedding(rotary_dim, base, partial_rotary_factor)
-        rotary_emb = rotary_emb_layer(position_ids)
+        use_yarn = bool(getattr(model_config, "qwen_rope_enable_yarn", False))
+        if use_yarn:
+            rope_scaling = getattr(model_config, "rope_scaling", None)
+            if isinstance(rope_scaling, dict):
+                scale = getattr(model_config, "qwen_rope_scaling_factor", None)
+                if scale is None:
+                    scale = rope_scaling.get("factor", 1.0)
+                original_max_position_embeddings = rope_scaling.get(
+                    "original_max_position_embeddings", getattr(model_config, "max_position_embeddings", 2048)
+                )
+                beta_fast = rope_scaling.get("beta_fast", 32)
+                beta_slow = rope_scaling.get("beta_slow", 1)
+                extrapolation_factor = rope_scaling.get("extrapolation_factor", 1.0)
+                attn_factor = rope_scaling.get("attn_factor", rope_scaling.get("attention_factor", 1.0))
+                mscale = rope_scaling.get("mscale", 1.0)
+            else:
+                scale = getattr(model_config, "qwen_rope_scaling_factor", None)
+                if scale is None:
+                    scale = 1.0
+                original_max_position_embeddings = getattr(model_config, "max_position_embeddings", 2048)
+                beta_fast = 32
+                beta_slow = 1
+                extrapolation_factor = 1.0
+                attn_factor = 1.0
+                mscale = 1.0
+
+            rotary_emb_layer = QwenYarnScalingRotaryEmbedding(
+                rotary_dim=rotary_dim,
+                base=base,
+                scale=scale,
+                original_max_position_embeddings=original_max_position_embeddings,
+                beta_fast=beta_fast,
+                beta_slow=beta_slow,
+                extrapolation_factor=extrapolation_factor,
+                attn_factor=attn_factor,
+                mscale=mscale,
+            )
+            rotary_emb = rotary_emb_layer(position_ids)
+        else:
+            rotary_emb_layer = QwenRotaryEmbedding(rotary_dim, base, partial_rotary_factor)
+            rotary_emb = rotary_emb_layer(position_ids)
     elif architecture.startswith("Glm"):
         rotary_emb_layer = GlmRotaryEmbedding(rotary_dim, base, partial_rotary_factor)
         rotary_emb = rotary_emb_layer(position_ids)
