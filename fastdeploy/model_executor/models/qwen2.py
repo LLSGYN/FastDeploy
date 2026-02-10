@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from functools import partial
 
@@ -51,6 +52,39 @@ from fastdeploy.model_executor.utils import (
     process_weights_before_loading,
 )
 
+import tencap as tc
+
+FD_DO_DEBUG_CAPTURE = os.getenv("FD_DO_DEBUG_CAPTURE", "0") == "1"
+if FD_DO_DEBUG_CAPTURE:
+    FD_DEBUG_CAPTURE_PATH = os.getenv("FD_DEBUG_CAPTURE_PATH", "")
+    assert FD_DEBUG_CAPTURE_PATH, "FD_DEBUG_CAPTURE_PATH must be set"
+    tc.setup(root_dir=FD_DEBUG_CAPTURE_PATH, max_captures=28)
+
+def paddle_rmsnorm_torchlike(x: paddle.Tensor, weight: paddle.Tensor, eps: float) -> paddle.Tensor:
+    """
+    用 paddle 原生算子复刻 torch 的 Qwen2RMSNorm math forward:
+      x_fp32 = x.to(fp32)
+      var = mean(x_fp32^2)
+      y_fp32 = x_fp32 * rsqrt(var + eps)
+      y = y_fp32.to(input_dtype)
+      out = weight * y
+
+    约定同上：x 已经是 forward() 内部 cast 后的值，
+    若存在 residual_input，则 x 已经是相加后的结果。
+    """
+    out_dtype = x.dtype
+
+    x_fp32 = x.astype("float32")
+    var = paddle.mean(x_fp32 * x_fp32, axis=-1, keepdim=True)
+    y_fp32 = x_fp32 * paddle.rsqrt(var + eps)
+
+    y = y_fp32.astype(out_dtype)
+    # torch 模型里 weight 通常也会跟随模型 dtype（bf16），这里显式 cast 保守对齐
+    w = weight.astype(out_dtype)
+    return y * w
+
+# DEBUG_RMSNORM = torch_rmsnorm_via_numpy      # 方案1：跨框架（慢，但逻辑最“像 torch”）
+DEBUG_RMSNORM = paddle_rmsnorm_torchlike   # 方案2：paddle 原生（推荐先试这个）
 
 class Qwen2MLP(nn.Layer):
     """ """
@@ -133,10 +167,19 @@ class Qwen2Attention(nn.Layer):
         """ """
         qkv_out = self.qkv_proj(hidden_states)
 
+        if (not forward_meta.is_dummy_or_profile_run) and FD_DO_DEBUG_CAPTURE:
+            with tc.scope("fd_results"):
+                qkv_np = qkv_out.astype("float32").numpy()
+                tc.dump_np(qkv_np, name="qkv")
+
         atten_out = self.attn(
             qkv=qkv_out,
             forward_meta=forward_meta,
         )
+        if (not forward_meta.is_dummy_or_profile_run) and FD_DO_DEBUG_CAPTURE:
+            with tc.scope("fd_results"):
+                atten_out_np = atten_out.astype("float32").numpy()
+                tc.dump_np(atten_out_np, name="atten_out")
         output = self.o_proj(atten_out)
         return output
 
@@ -193,18 +236,49 @@ class Qwen2DecoderLayer(nn.Layer):
     ):
         """ """
         # Self Attention
+        # if not forward_meta.is_dummy_or_profile_run:
+        #     with tc.scope("fd_results"):
+        #         pre_norm_hidden_np = hidden_states.astype("float32").numpy()
+        #         tc.dump_np(pre_norm_hidden_np, name="pre_input_norm_hidden")
+        if (not forward_meta.is_dummy_or_profile_run) and FD_DO_DEBUG_CAPTURE:
+            with tc.scope("fd_results"):
+                if residual is None:
+                    pre = hidden_states.astype('float32')
+                else:
+                    pre = (hidden_states + residual).astype('float32')
+                tc.dump_np(pre.numpy(), name="pre_input_norm_hidden")
+
         hidden_states, residual = self.input_layernorm(
-            hidden_states, residual_input=residual, forward_meta=forward_meta
+            hidden_states, residual_input=residual, forward_meta=forward_meta,
+            external_rmsnorm=DEBUG_RMSNORM,
         )
+        if (not forward_meta.is_dummy_or_profile_run) and FD_DO_DEBUG_CAPTURE:
+            with tc.scope("fd_results"):
+                post_norm_hidden_np = hidden_states.astype("float32").numpy()
+                tc.dump_np(post_norm_hidden_np, name="post_input_norm_hidden")
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             forward_meta=forward_meta,
         )
+        if (not forward_meta.is_dummy_or_profile_run) and FD_DO_DEBUG_CAPTURE:
+            with tc.scope("fd_results"):
+                post_attn_hidden_np = hidden_states.astype("float32").numpy()
+                tc.dump_np(post_attn_hidden_np, name="post_attn_hidden")
+                if residual is None:
+                    pre_second = hidden_states.astype('float32')
+                else:
+                    pre_second = (hidden_states + residual).astype('float32')
+                tc.dump_np(pre_second.numpy(), name="pre_second_norm_hidden")
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual, external_rmsnorm=DEBUG_RMSNORM)
+        if (not forward_meta.is_dummy_or_profile_run) and FD_DO_DEBUG_CAPTURE:
+            with tc.scope("fd_results"):
+                post_second_norm_hidden = hidden_states.astype("float32").numpy()
+                tc.dump_np(post_second_norm_hidden, name="post_second_norm_hidden")
 
+            tc.step()
         hidden_states = self.mlp(hidden_states, forward_meta)
 
         return hidden_states, residual

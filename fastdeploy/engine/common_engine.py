@@ -1744,6 +1744,7 @@ class EngineService:
             "lm_head_fp32": self.cfg.model_config.lm_head_fp32,
             "enable_entropy": self.cfg.model_config.enable_entropy,
             "enable_rr_attention": self.cfg.model_config.enable_rr_attention,
+            "qwen_rope_enable_yarn": self.cfg.model_config.qwen_rope_enable_yarn,
         }
         for worker_flag, value in worker_store_true_flag.items():
             if value:
@@ -1751,6 +1752,7 @@ class EngineService:
 
         worker_default_none_flag = {
             "num_gpu_blocks_override": self.cfg.cache_config.num_gpu_blocks_override,
+            "qwen_rope_scaling_factor": self.cfg.model_config.qwen_rope_scaling_factor,
         }
         for worker_flag, value in worker_default_none_flag.items():
             if value:

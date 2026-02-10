@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import numpy as np
 from typing import TYPE_CHECKING
 
 import paddle
@@ -40,6 +41,8 @@ from fastdeploy.utils import console_logger as logger
 if TYPE_CHECKING:
     from fastdeploy.model_executor.forward_meta import ForwardMeta
 
+import tencap as tc
+FD_DO_DEBUG_CAPTURE = os.getenv("FD_DO_DEBUG_CAPTURE", "0") == "1"
 
 class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
     """
@@ -206,7 +209,7 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
             max_just_dec_len_this_time = int(max_len_tensor_cpu[4].item())
 
             eligible_flashmask_prefill = (
-                fa_version == 3
+                fa_version >= 2
                 and not (cudnn_deterministic and self.head_dim > 128)
                 and max_enc_len_this_time > 0
                 and max_just_dec_len_this_time == 0
@@ -315,11 +318,14 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
                 k_dense[0, :token_num] = k_packed
                 v_dense[0, :token_num] = v_packed
 
-                # # Flashmask attention support GQA natively; no need to repeat_interleave.
-                # if self.kv_num_heads != self.num_heads:
-                #     k_dense = paddle.repeat_interleave(k_dense, self.group_size, axis=2)
-                #     v_dense = paddle.repeat_interleave(v_dense, self.group_size, axis=2)
-
+                if (not forward_meta.is_dummy_or_profile_run) and FD_DO_DEBUG_CAPTURE:
+                    with tc.scope("fd_results"):
+                        q_dense_np = q_packed.unsqueeze(0).astype("float32").numpy()
+                        k_dense_np = k_packed.unsqueeze(0).astype("float32").numpy()
+                        rotary_emb_np = forward_meta.rotary_embs.astype("float32").numpy()
+                        tc.dump_np(q_dense_np, name="q_rope")
+                        tc.dump_np(k_dense_np, name="k_rope")
+                        tc.dump_np(rotary_emb_np, name="rot_emb")
 
                 startend_tensor = paddle.full([1, 1, max_len_this_time, 1], max_len_this_time, dtype="int32")
                 if token_num < max_len_this_time:
