@@ -21,6 +21,7 @@ import re
 from functools import partial
 
 import paddle
+import paddle.nn.functional as F
 from paddle import nn
 from paddleformers.transformers import PretrainedModel
 from paddleformers.utils.log import logger
@@ -95,6 +96,7 @@ class Qwen2MLP(nn.Layer):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.fd_config = fd_config
         self.up_gate_proj = MergedColumnParallelLinear(
             fd_config=fd_config,
             prefix=f"{prefix}.up_gate_proj",
@@ -117,6 +119,7 @@ class Qwen2MLP(nn.Layer):
             bias=getattr(self.up_gate_proj, "bias", None),
             act_method=fd_config.model_config.hidden_act,
         )
+        self.hidden_act = fd_config.model_config.hidden_act
 
     def load_state_dict(self, state_dict):
         """ """
@@ -125,9 +128,42 @@ class Qwen2MLP(nn.Layer):
 
     def forward(self, x, forward_meta):
         """ """
-        gate_up_out = self.up_gate_proj(x)
-        act_out = self.act_fn(gate_up_out)
-        down_out = self.down_proj(act_out)
+        is_basic_case = (
+            self.fd_config.parallel_config.tensor_parallel_size == 1
+            and not self.fd_config.model_config.is_quantized
+        )
+        if not is_basic_case:
+            gate_up_out = self.up_gate_proj(x)
+            act_out = self.act_fn(gate_up_out)
+            down_out = self.down_proj(act_out)
+            return down_out
+
+        up_gate_weight = self.up_gate_proj.weight
+        up_gate_bias = getattr(self.up_gate_proj, "bias", None)
+        intermediate_size = up_gate_weight.shape[-1] // 2
+
+        gate_weight = up_gate_weight[:, :intermediate_size]
+        up_weight = up_gate_weight[:, intermediate_size:]
+
+        gate_bias = None
+        up_bias = None
+        if up_gate_bias is not None:
+            gate_bias = up_gate_bias[:intermediate_size]
+            up_bias = up_gate_bias[intermediate_size:]
+
+        gate_out = F.linear(x=x, weight=gate_weight, bias=gate_bias)
+        up_out = F.linear(x=x, weight=up_weight, bias=up_bias)
+
+        if self.hidden_act in ["silu", "swish"]:
+            act_out = F.silu(gate_out) * up_out
+        else:
+            act_out = self.act_fn(paddle.concat([gate_out, up_out], axis=-1))
+
+        down_out = F.linear(
+            x=act_out,
+            weight=self.down_proj.weight,
+            bias=getattr(self.down_proj, "bias", None),
+        )
         return down_out
 
 
@@ -136,6 +172,7 @@ class Qwen2Attention(nn.Layer):
 
     def __init__(self, fd_config: FDConfig, layer_id: int, prefix: str = "") -> None:
         super().__init__()
+        self.fd_config = fd_config
 
         self.qkv_proj = QKVParallelLinear(fd_config=fd_config, prefix=f"{prefix}.qkv_proj", with_bias=True)
 
@@ -165,7 +202,33 @@ class Qwen2Attention(nn.Layer):
         hidden_states: paddle.Tensor,
     ):
         """ """
-        qkv_out = self.qkv_proj(hidden_states)
+        is_basic_case = (
+            self.fd_config.parallel_config.tensor_parallel_size == 1
+            and not self.fd_config.model_config.is_quantized
+        )
+        if not is_basic_case:
+            qkv_out = self.qkv_proj(hidden_states)
+        else:
+            q_size = self.qkv_proj.num_heads_per_rank * self.qkv_proj.head_dim
+            k_size = self.qkv_proj.kv_num_heads_per_rank * self.qkv_proj.head_dim
+            v_size = self.qkv_proj.kv_num_heads_per_rank * self.qkv_proj.head_dim
+
+            qkv_weight = self.qkv_proj.weight
+            q_weight = qkv_weight[:, :q_size]
+            k_weight = qkv_weight[:, q_size : q_size + k_size]
+            v_weight = qkv_weight[:, q_size + k_size : q_size + k_size + v_size]
+
+            q_bias = k_bias = v_bias = None
+            qkv_bias = getattr(self.qkv_proj, "bias", None)
+            if qkv_bias is not None:
+                q_bias = qkv_bias[:q_size]
+                k_bias = qkv_bias[q_size : q_size + k_size]
+                v_bias = qkv_bias[q_size + k_size : q_size + k_size + v_size]
+
+            q_out = F.linear(x=hidden_states, weight=q_weight, bias=q_bias)
+            k_out = F.linear(x=hidden_states, weight=k_weight, bias=k_bias)
+            v_out = F.linear(x=hidden_states, weight=v_weight, bias=v_bias)
+            qkv_out = paddle.concat([q_out, k_out, v_out], axis=-1)
 
         if (not forward_meta.is_dummy_or_profile_run) and FD_DO_DEBUG_CAPTURE:
             with tc.scope("fd_results"):
