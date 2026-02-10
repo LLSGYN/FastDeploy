@@ -674,6 +674,17 @@ def parse_args():
     parser.add_argument("--pod_ip", type=str, default="127.0.0.1")
     parser.add_argument("--engine_worker_queue_port", type=str, default="9923")
     parser.add_argument("--max_model_len", type=int, default=3072, help="max model len")
+    parser.add_argument(
+        "--qwen_rope_enable_yarn",
+        action="store_true",
+        help="Enable YaRN rotary embedding for Qwen-family models (e.g., Qwen2).",
+    )
+    parser.add_argument(
+        "--qwen_rope_scaling_factor",
+        type=float,
+        default=None,
+        help="YaRN rope scaling factor (target_len / original_len) for Qwen-family models.",
+    )
     parser.add_argument("--device_ids", type=str, default="0", help="cuda visible devices")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="input dtype")
     parser.add_argument("--enc_dec_block_num", type=int, default=1, help="encoder's decoder num")
