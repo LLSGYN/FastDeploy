@@ -523,16 +523,46 @@ class Sampler(nn.Layer):
             elif self.logprobs_mode == "processed_logits":
                 raw_logprobs = logits.clone()
 
-        probs = F.softmax(logits)
+        # Match HF greedy semantics when do_sample=False:
+        # choose argmax on post-processor logits instead of sampling kernels.
+        do_sample_mask = None
+        if sampling_metadata.do_sample is not None:
+            do_sample_mask = sampling_metadata.do_sample[: logits.shape[0]].reshape([-1]).astype("bool")
 
-        probs = min_p_sampling(probs, sampling_metadata.min_p, sampling_metadata.min_p_list)
-        _, next_tokens = top_k_top_p_sampling(
-            probs,
-            sampling_metadata.top_p,
-            sampling_metadata.top_k,
-            sampling_metadata.top_k_list,
-            topp_seed=sampling_metadata.seed,
-        )
+        probs = F.softmax(logits)
+        if do_sample_mask is None:
+            probs = min_p_sampling(probs, sampling_metadata.min_p, sampling_metadata.min_p_list)
+            _, next_tokens = top_k_top_p_sampling(
+                probs,
+                sampling_metadata.top_p,
+                sampling_metadata.top_k,
+                sampling_metadata.top_k_list,
+                topp_seed=sampling_metadata.seed,
+            )
+        elif bool(paddle.all(do_sample_mask).item()):
+            probs = min_p_sampling(probs, sampling_metadata.min_p, sampling_metadata.min_p_list)
+            _, next_tokens = top_k_top_p_sampling(
+                probs,
+                sampling_metadata.top_p,
+                sampling_metadata.top_k,
+                sampling_metadata.top_k_list,
+                topp_seed=sampling_metadata.seed,
+            )
+        elif bool(paddle.all(paddle.logical_not(do_sample_mask)).item()):
+            greedy_logits = logits.astype("float32") if logits.dtype != paddle.float32 else logits
+            next_tokens = paddle.argmax(greedy_logits, axis=-1).unsqueeze(-1)
+        else:
+            sample_probs = min_p_sampling(probs, sampling_metadata.min_p, sampling_metadata.min_p_list)
+            _, sampled_tokens = top_k_top_p_sampling(
+                sample_probs,
+                sampling_metadata.top_p,
+                sampling_metadata.top_k,
+                sampling_metadata.top_k_list,
+                topp_seed=sampling_metadata.seed,
+            )
+            greedy_logits = logits.astype("float32") if logits.dtype != paddle.float32 else logits
+            greedy_tokens = paddle.argmax(greedy_logits, axis=-1).unsqueeze(-1)
+            next_tokens = paddle.where(do_sample_mask.unsqueeze(-1), sampled_tokens, greedy_tokens)
 
         logprobs_tensors = (
             None if num_logprobs is None else self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=next_tokens)

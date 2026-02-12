@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import numpy as np
 from typing import TYPE_CHECKING
@@ -51,7 +50,7 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
 
     - Prefill-only (first prefill) path: uses Paddle `flashmask_attention` v3, but still
       writes FastDeploy paged KV cache via `gqa_rope_write_cache` for subsequent decode.
-    - Decode fallback path: uses math attention in Python for pure decode.
+    - Decode fallback path: uses Paddle flash attention for pure decode.
 
     Env knobs:
     - FD_USE_PADDLE_FLASHMASK_PREFILL=1: enable flashmask prefill path (when eligible)
@@ -375,7 +374,7 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
             )
         # return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
 
-        # Decode fallback: avoid super().forward_mixed and use math attention.
+        # Decode fallback: avoid super().forward_mixed and use flash attention.
         max_len_tensor_cpu = forward_meta.max_len_tensor_cpu
         max_enc_len_this_time = int(max_len_tensor_cpu[1].item())
         max_just_dec_len_this_time = int(max_len_tensor_cpu[4].item())
@@ -384,6 +383,7 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
             raise RuntimeError(
                 "AppendAttentionFlashMaskPrefillBackend decode fallback only supports pure decode. "
                 f"max_enc_len_this_time={max_enc_len_this_time}, max_just_dec_len_this_time={max_just_dec_len_this_time}"
+            )
         #     return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
 
         cache_quant_type_str = getattr(layer, "cache_quant_type_str", "none")
@@ -458,18 +458,21 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
         if token_num == 0:
             return paddle.empty([0, self.num_heads * self.head_dim], dtype=qkv.dtype)
         if int(forward_meta.seq_lens_this_time.shape[0]) != 1:
-            raise NotImplementedError("decode math fallback currently requires effective batch size = 1.")
+            raise NotImplementedError("decode flash attention fallback currently requires effective batch size = 1.")
 
-        if self.group_size > 1:
-            k_decode = paddle.repeat_interleave(k_decode, repeats=self.group_size, axis=1)
-            v_decode = paddle.repeat_interleave(v_decode, repeats=self.group_size, axis=1)
+        # flash_attention expects [batch, seq_len, num_heads, head_dim].
+        query_states = q_decode.unsqueeze(0)
+        key_states = k_decode.unsqueeze(0)
+        value_states = v_decode.unsqueeze(0)
 
-        query_states = paddle.transpose(q_decode, [1, 0, 2]).unsqueeze(0)
-        key_states = paddle.transpose(k_decode, [1, 0, 2]).unsqueeze(0)
-        value_states = paddle.transpose(v_decode, [1, 0, 2]).unsqueeze(0)
-
-        attn_weights = paddle.matmul(query_states, key_states.transpose([0, 1, 3, 2])) / math.sqrt(self.head_dim)
         # Decode path does not need causal mask here.
-        attn_weights = F.softmax(attn_weights, axis=-1, dtype=paddle.float32).astype(query_states.dtype)
-        attn_output = paddle.matmul(attn_weights, value_states)
-        return paddle.transpose(attn_output.squeeze(0), [1, 0, 2]).reshape([token_num, self.num_heads * self.head_dim])
+        attn_output = F.flashmask_attention(
+            query_states,
+            key_states,
+            value_states,
+            dropout=0.0,
+            causal=False,
+        )
+        if isinstance(attn_output, (tuple, list)):
+            attn_output = attn_output[0]
+        return attn_output[0].reshape([token_num, self.num_heads * self.head_dim])

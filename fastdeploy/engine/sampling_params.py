@@ -59,6 +59,8 @@ class SamplingParams:
         min_p: Float that represents the minimum probability for a token to be
             considered, relative to the probability of the most likely token.
             Must be in [0, 1]. Set to 0 to disable this.
+        do_sample: Whether to sample stochastically (`True`) or use greedy
+            decoding (`False`). If `None`, keep backend default behavior.
         seed: Random seed to use for the generation.
         stop: list of strings that stop the generation when they are generated.
             The returned output will not contain the stop strings.
@@ -91,6 +93,7 @@ class SamplingParams:
     top_p: float = None
     top_k: int = 0
     min_p: float = 0.0
+    do_sample: Optional[bool] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stop_token_ids: Optional[List[int]] = None
@@ -130,6 +133,7 @@ class SamplingParams:
         top_p,
         top_k,
         min_p,
+        do_sample=None,
         seed=None,
         stop=None,
         stop_token_ids=None,
@@ -154,6 +158,7 @@ class SamplingParams:
             top_p=top_p,
             top_k=top_k if top_k is not None else 0,
             min_p=min_p if min_p is not None else 0.0,
+            do_sample=do_sample,
             seed=seed,
             stop=stop,
             stop_token_ids=stop_token_ids,
@@ -186,6 +191,8 @@ class SamplingParams:
             raise ValueError("repetition_penalty must be greater than zero, got " f"{self.repetition_penalty}.")
         if self.temperature is not None and self.temperature < 0.0:
             raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
+        if self.do_sample is not None and not isinstance(self.do_sample, bool):
+            raise TypeError(f"do_sample must be a bool, got {type(self.do_sample).__name__}")
         if self.top_p is not None and not 0.0 <= self.top_p <= 1.0:
             raise ValueError(f"top_p must be in [0, 1], got {self.top_p}.")
         # quietly accept -1 as disabled, but prefer 0

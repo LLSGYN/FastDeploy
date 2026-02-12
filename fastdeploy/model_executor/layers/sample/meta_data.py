@@ -47,6 +47,7 @@ class SamplingMetadata:
     top_k_list: Optional[list] = None
     min_p: Optional[paddle.Tensor] = None
     min_p_list: Optional[list] = None
+    do_sample: Optional[paddle.Tensor] = None
     seed: Optional[paddle.Tensor] = None
     max_num_logprobs: Optional[int] = None
     enable_early_stop: Optional[int] = False

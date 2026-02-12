@@ -774,7 +774,11 @@ class GPUModelRunner(ModelRunnerBase):
             self.share_inputs["top_k_list"][idx] = request.get("top_k", 0)
             self.share_inputs["min_p"][idx : idx + 1] = request.get("min_p", 0.0)
             self.share_inputs["min_p_list"][idx] = request.get("min_p", 0.0)
-            self.share_inputs["temperature"][idx : idx + 1] = request.get("temperature", 0.95)
+            do_sample = request.get("do_sample", True)
+            if do_sample is None:
+                do_sample = True
+            self.share_inputs["do_sample"][idx : idx + 1] = bool(do_sample)
+            self.share_inputs["temperature"][idx : idx + 1] = request.get("temperature", 0.95) if do_sample else 1.0
             self.share_inputs["penalty_score"][idx : idx + 1] = request.get("repetition_penalty", 1.0)
             self.share_inputs["frequency_score"][idx : idx + 1] = request.get("frequency_penalty", 0.0)
             self.share_inputs["presence_score"][idx : idx + 1] = request.get("presence_penalty", 0.0)
@@ -981,8 +985,13 @@ class GPUModelRunner(ModelRunnerBase):
             self.share_inputs["top_k_list"][idx] = request.get("top_k", 0)
             self.share_inputs["min_p"][idx : idx + 1] = request.get("min_p", 0.0)
             self.share_inputs["min_p_list"][idx] = request.get("min_p", 0.0)
-
-            self.share_inputs["temperature"][idx : idx + 1] = get_attr_from_request(request, "temperature", 0.95)
+            do_sample = get_attr_from_request(request, "do_sample", True)
+            if do_sample is None:
+                do_sample = True
+            self.share_inputs["do_sample"][idx : idx + 1] = bool(do_sample)
+            self.share_inputs["temperature"][idx : idx + 1] = (
+                get_attr_from_request(request, "temperature", 0.95) if do_sample else 1.0
+            )
             self.share_inputs["penalty_score"][idx : idx + 1] = get_attr_from_request(
                 request, "repetition_penalty", 1.0
             )
@@ -1193,6 +1202,7 @@ class GPUModelRunner(ModelRunnerBase):
         self.share_inputs["top_k_list"] = [0] * max_num_seqs
         self.share_inputs["min_p"] = paddle.full([max_num_seqs, 1], 0.0, dtype="float32")
         self.share_inputs["min_p_list"] = [0.0] * max_num_seqs
+        self.share_inputs["do_sample"] = paddle.full([max_num_seqs, 1], True, dtype="bool")
         self.share_inputs["temperature"] = paddle.full(
             [max_num_seqs, 1], self.model_config.temperature, dtype="float32"
         )
@@ -1485,6 +1495,7 @@ class GPUModelRunner(ModelRunnerBase):
             top_k_list=self.share_inputs["top_k_list"],
             min_p=self.share_inputs["min_p"],
             min_p_list=self.share_inputs["min_p_list"],
+            do_sample=self.share_inputs["do_sample"],
             seed=self.share_inputs["infer_seed"],
             step_idx=self.share_inputs["step_idx"],
             pre_token_ids=self.share_inputs["pre_ids"],
