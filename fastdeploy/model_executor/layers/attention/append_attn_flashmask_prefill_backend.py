@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import numpy as np
 from typing import TYPE_CHECKING
@@ -50,7 +51,7 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
 
     - Prefill-only (first prefill) path: uses Paddle `flashmask_attention` v3, but still
       writes FastDeploy paged KV cache via `gqa_rope_write_cache` for subsequent decode.
-    - Decode path: falls back to the standard AppendAttentionBackend implementation.
+    - Decode fallback path: uses math attention in Python for pure decode.
 
     Env knobs:
     - FD_USE_PADDLE_FLASHMASK_PREFILL=1: enable flashmask prefill path (when eligible)
@@ -372,4 +373,103 @@ class AppendAttentionFlashMaskPrefillBackend(AppendAttentionBackend):
                 "[AppendAttentionFlashMaskPrefillBackend] flashmask prefill path not taken; "
                 "falling back to AppendAttentionBackend."
             )
-        return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
+        # return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
+
+        # Decode fallback: avoid super().forward_mixed and use math attention.
+        max_len_tensor_cpu = forward_meta.max_len_tensor_cpu
+        max_enc_len_this_time = int(max_len_tensor_cpu[1].item())
+        max_just_dec_len_this_time = int(max_len_tensor_cpu[4].item())
+        is_pure_decode = max_enc_len_this_time == 0 and max_just_dec_len_this_time > 0
+        if not is_pure_decode:
+            raise RuntimeError(
+                "AppendAttentionFlashMaskPrefillBackend decode fallback only supports pure decode. "
+                f"max_enc_len_this_time={max_enc_len_this_time}, max_just_dec_len_this_time={max_just_dec_len_this_time}"
+        #     return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
+
+        cache_quant_type_str = getattr(layer, "cache_quant_type_str", "none")
+        if cache_quant_type_str not in ("none", "cache_int8", "cache_fp8", "cache_int4_zp"):
+            if self._debug and layer.layer_id == 0:
+                logger.info(
+                    "[AppendAttentionFlashMaskPrefillBackend] decode math fallback does not support "
+                    f"cache_quant_type={cache_quant_type_str}; fallback to AppendAttentionBackend."
+                )
+            return super().forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
+
+        cache_k = forward_meta.caches[2 * layer.layer_id]
+        cache_v = forward_meta.caches[2 * layer.layer_id + 1]
+        cache_k_quant_scales = getattr(layer, "cache_k_scale", None)
+        cache_v_quant_scales = getattr(layer, "cache_v_scale", None)
+
+        # gqa_rope_write_cache follows encoder-style RoPE positioning.
+        # For pure decode we pass a local non-zero seq_lens_encoder view so RoPE indices align with seq_lens_decoder.
+        fake_seq_lens_encoder = paddle.full_like(forward_meta.seq_lens_encoder, 1)
+        max_dec_len_this_time = int(max_len_tensor_cpu[2].item())
+        (
+            attn_cu_seqlens_k,
+            pre_cache_batch_ids,
+            pre_cache_tile_ids_per_batch,
+            pre_cache_num_blocks_cpu,
+            kv_token_num_cpu,
+        ) = pre_cache_len_concat(
+            fake_seq_lens_encoder,
+            forward_meta.seq_lens_decoder,
+            forward_meta.seq_lens_this_time,
+            max_dec_len_this_time,
+            self.block_size,
+        )
+        kv_token_num = int(kv_token_num_cpu[0].item())
+
+        q_decode, k_decode, v_decode, _ = gqa_rope_write_cache(
+            qkv,
+            cache_k,
+            cache_v,
+            forward_meta.cu_seqlens_q,
+            attn_cu_seqlens_k,
+            forward_meta.rotary_embs,
+            forward_meta.seq_lens_this_time,
+            fake_seq_lens_encoder,
+            forward_meta.seq_lens_decoder,
+            forward_meta.batch_id_per_token,
+            forward_meta.block_tables,
+            forward_meta.kv_batch_ids,
+            forward_meta.kv_tile_ids_per_batch,
+            forward_meta.kv_num_blocks_x_cpu,
+            pre_cache_batch_ids,
+            pre_cache_tile_ids_per_batch,
+            pre_cache_num_blocks_cpu,
+            getattr(layer, "q_norm_weight", None),
+            getattr(layer, "k_norm_weight", None),
+            cache_k_quant_scales,
+            cache_v_quant_scales,
+            getattr(layer, "cache_k_out_scale", None),
+            getattr(layer, "cache_v_out_scale", None),
+            getattr(layer, "cache_k_zp", None),
+            getattr(layer, "cache_v_zp", None),
+            metadata.kv_signal_data_list[layer.layer_id],
+            kv_token_num=kv_token_num,
+            max_seq_len=self.max_seq_len,
+            rms_norm_eps=getattr(layer, "rms_norm_eps", 1e-6),
+            use_neox_rotary_style=layer.use_neox_rotary_style,
+            cache_quant_type=cache_quant_type_str,
+            rope_3d=self.rope_3d,
+        )
+
+        token_num = int(q_decode.shape[0])
+        if token_num == 0:
+            return paddle.empty([0, self.num_heads * self.head_dim], dtype=qkv.dtype)
+        if int(forward_meta.seq_lens_this_time.shape[0]) != 1:
+            raise NotImplementedError("decode math fallback currently requires effective batch size = 1.")
+
+        if self.group_size > 1:
+            k_decode = paddle.repeat_interleave(k_decode, repeats=self.group_size, axis=1)
+            v_decode = paddle.repeat_interleave(v_decode, repeats=self.group_size, axis=1)
+
+        query_states = paddle.transpose(q_decode, [1, 0, 2]).unsqueeze(0)
+        key_states = paddle.transpose(k_decode, [1, 0, 2]).unsqueeze(0)
+        value_states = paddle.transpose(v_decode, [1, 0, 2]).unsqueeze(0)
+
+        attn_weights = paddle.matmul(query_states, key_states.transpose([0, 1, 3, 2])) / math.sqrt(self.head_dim)
+        # Decode path does not need causal mask here.
+        attn_weights = F.softmax(attn_weights, axis=-1, dtype=paddle.float32).astype(query_states.dtype)
+        attn_output = paddle.matmul(attn_weights, value_states)
+        return paddle.transpose(attn_output.squeeze(0), [1, 0, 2]).reshape([token_num, self.num_heads * self.head_dim])
